@@ -156,7 +156,7 @@ in {
       name = pamService;
       value = {
         text = ''
-          session optional ${pkgs.pam_script}/lib/security/pam_script.so dir=${pkgs.writeTextDir "login_check.sh" ''
+          session optional ${pkgs.pamScript}/lib/security/pam_script.so dir=${pkgs.writeTextDir "login_check.sh" ''
             #!/bin/sh
             if [ -f /var/lib/auto-rollback/confirmation-needed ]; then
               echo "WARNING: NixOS configuration has changed. Please run 'nixos-confirm' within the timeout to prevent automatic rollback."
