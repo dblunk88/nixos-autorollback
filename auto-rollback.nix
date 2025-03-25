@@ -151,19 +151,35 @@ in {
       };
     };
     
-    # PAM module to show message after login
-    security.pam.services = builtins.listToAttrs (map (pamService: {
-      name = pamService;
-      value = {
-        text = ''
-          session optional ${pkgs.pamScript}/lib/security/pam_script.so dir=${pkgs.writeTextDir "login_check.sh" ''
-            #!/bin/sh
-            if [ -f /var/lib/auto-rollback/confirmation-needed ]; then
-              echo "WARNING: NixOS configuration has changed. Please run 'nixos-confirm' within the timeout to prevent automatic rollback."
-            fi
-          ''}
+    # Create a system-wide message of the day to notify about pending confirmations
+    environment.etc."issue.d/auto-rollback.issue".text = ''
+      
+      \033[1;31mNOTICE\033[0m: If there was a recent NixOS configuration change, 
+      please run '\033[1;32mnixos-confirm\033[0m' within the timeout to prevent automatic rollback.
+      
+    '';
+    
+    # Create a systemd service to check for pending confirmations at login
+    systemd.services.auto-rollback-login-check = {
+      description = "Check for pending NixOS configuration confirmations";
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = pkgs.writeShellScript "auto-rollback-login-check" ''
+          #!/usr/bin/env bash
+          if [ -f /var/lib/auto-rollback/confirmation-needed ]; then
+            echo -e "\033[1;31mWARNING\033[0m: NixOS configuration has changed. Please run '\033[1;32mnixos-confirm\033[0m' within the timeout to prevent automatic rollback."
+          fi
         '';
       };
-    }) [ "login" "sshd" ]);
+      wantedBy = [ "multi-user.target" ];
+    };
+    
+    # Add a profile script to check for pending confirmations
+    environment.etc."profile.d/auto-rollback-check.sh".text = ''
+      if [ -f /var/lib/auto-rollback/confirmation-needed ]; then
+        echo -e "\033[1;31mWARNING\033[0m: NixOS configuration has changed. Please run '\033[1;32mnixos-confirm\033[0m' within the timeout to prevent automatic rollback."
+      fi
+    '';
   };
 }
