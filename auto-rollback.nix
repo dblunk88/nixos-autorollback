@@ -1,6 +1,4 @@
-# NixOS Auto-Rollback System
-# Save this as /etc/nixos/auto-rollback.nix and import it in your configuration.nix
-
+# This file should be imported in your configuration.nix
 { config, lib, pkgs, ... }:
 
 with lib;
@@ -8,246 +6,164 @@ with lib;
 let
   cfg = config.services.auto-rollback;
   
-  # Script to check if generation has changed
-  checkGenScript = pkgs.writeScript "check-generation-change" ''
-    #!/bin/sh
-    
-    # Store the current generation number
+  # Script to detect generation changes
+  genChangeDetectorScript = pkgs.writeShellScript "gen-change-detector" ''
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    # Get current generation number
     CURRENT_GEN=$(readlink -f /run/current-system | grep -o '[0-9]\+' | head -n1)
     
-    # Get the previous generation from our state file, if it exists
+    # Read last saved generation
     if [ -f /var/lib/auto-rollback/last-gen ]; then
-      PREV_GEN=$(cat /var/lib/auto-rollback/last-gen)
+      LAST_GEN=$(cat /var/lib/auto-rollback/last-gen)
     else
-      # First run, create directory and store current gen
+      # If no saved generation, just save current and exit
       mkdir -p /var/lib/auto-rollback
       echo "$CURRENT_GEN" > /var/lib/auto-rollback/last-gen
-      exit 0  # No need to trigger confirmation for the first run
+      exit 0
     fi
     
-    # If generation changed, trigger the confirmation service
-    if [ "$CURRENT_GEN" != "$PREV_GEN" ]; then
+    # Check if generation changed
+    if [ "$CURRENT_GEN" != "$LAST_GEN" ]; then
+      # Save new generation
       echo "$CURRENT_GEN" > /var/lib/auto-rollback/last-gen
-      echo "Generation changed from $PREV_GEN to $CURRENT_GEN"
-      exit 0  # Return success to trigger the confirmation
-    else
-      exit 1  # No change, don't trigger confirmation
-    fi
-  '';
-  
-  # Script for the confirmation service
-  confirmationScript = pkgs.writeScript "generation-confirmation" ''
-    #!/bin/sh
-    
-    # Cancel any existing rollback timers
-    systemctl stop auto-rollback-timer.timer || true
-    systemctl stop auto-rollback-timer.service || true
-    
-    # Start a new timer
-    systemctl start auto-rollback-timer.timer
-    
-    # Function to clean up on exit
-    cleanup() {
-      systemctl stop auto-rollback-timer.timer
-      systemctl stop auto-rollback-timer.service
-      exit 0
-    }
-    
-    CURRENT_GEN=$(readlink -f /run/current-system | grep -o '[0-9]\+' | head -n1)
-    
-    # Display the message on all ttys and via wall
-    for tty in /dev/tty*; do
-      if [ -w "$tty" ]; then
-        echo -e "\n\033[1;31mWARNING: System generation changed to $CURRENT_GEN.\033[0m" > $tty
-        echo -e "\033[1;31mPress any key within 5 minutes to confirm this generation works.\033[0m" > $tty
-        echo -e "\033[1;31mOtherwise, system will roll back automatically.\033[0m\n" > $tty
-      fi
-    done
-    
-    # Also send wall message for SSH users
-    ${pkgs.utillinux}/bin/wall "WARNING: System generation changed to $CURRENT_GEN. Press any key within 5 minutes to confirm or system will roll back."
-    
-    # Set up trap to clean up on exit
-    trap cleanup INT TERM
-    
-    # Set up named pipe for input
-    PIPE_DIR="/run/auto-rollback"
-    mkdir -p "$PIPE_DIR"
-    PIPE="$PIPE_DIR/confirmation-pipe"
-    
-    # Remove pipe if it exists
-    rm -f "$PIPE"
-    
-    # Create named pipe
-    mkfifo "$PIPE"
-    
-    # For local terminals
-    for tty in /dev/tty*; do
-      if [ -w "$tty" ] && [ -r "$tty" ]; then
-        # Launch background cat process that will exit on first keypress
-        cat "$tty" > "$PIPE" &
-      fi
-    done
-    
-    # For SSH users (create a temporary socket that accepts connections)
-    ${pkgs.socat}/bin/socat TCP-LISTEN:${toString cfg.sshConfirmPort},bind=127.0.0.1,fork PIPE:"$PIPE" &
-    SOCAT_PID=$!
-    
-    # Add instructions to motd for SSH users
-    MOTD_FILE="/etc/motd.rollback"
-    echo -e "\n\033[1;31mWARNING: System generation confirmation needed.\033[0m" > $MOTD_FILE
-    echo -e "\033[1;31mTo confirm the current generation works, run:\033[0m" >> $MOTD_FILE
-    echo -e "\033[1;31mecho 'confirm' | nc localhost ${toString cfg.sshConfirmPort}\033[0m\n" >> $MOTD_FILE
-    
-    # Link the motd
-    ln -sf "$MOTD_FILE" /etc/motd
-    
-    # Wait for input from pipe (any key)
-    if read -t 300 -n 1 input < "$PIPE"; then
-      # User confirmed, cancel rollback
-      systemctl stop auto-rollback-timer.timer
-      ${pkgs.utillinux}/bin/wall "System generation $CURRENT_GEN confirmed. Rollback canceled."
-      echo "User confirmed generation $CURRENT_GEN, canceling rollback."
       
-      # Clean up
-      rm -f "$PIPE"
-      rm -f "$MOTD_FILE"
-      rm -f /etc/motd
-      kill $SOCAT_PID 2>/dev/null || true
-      exit 0
-    else
-      # Shouldn't get here normally, the timer should trigger first
-      # But just in case, let's roll back
-      "${rollbackScript}"
+      # Mark that confirmation is needed and store the previous generation for potential rollback
+      echo "$LAST_GEN" > /var/lib/auto-rollback/rollback-gen
+      touch /var/lib/auto-rollback/confirmation-needed
+      
+      # Start the confirmation timer service
+      systemctl start auto-rollback-timer.service
+      
+      # Notify all logged-in users
+      for USER_WITH_TTY in $(w -h | awk '{print $1}' | sort -u); do
+        USER_DISPLAY=$(w | grep "$USER_WITH_TTY" | grep -o ':[0-9]\+' | head -n1)
+        if [ -n "$USER_DISPLAY" ]; then
+          su - "$USER_WITH_TTY" -c "DISPLAY=$USER_DISPLAY DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u "$USER_WITH_TTY")/bus notify-send -u critical 'NixOS Generation Change' 'System configuration has changed. Please run \"nixos-confirm\" within 5 minutes to prevent rollback.'"
+        fi
+      done
+      
+      # Broadcast message to all terminals
+      echo "NixOS configuration generation has changed. Please run 'nixos-confirm' within 5 minutes to prevent automatic rollback." | wall
     fi
   '';
   
-  # Script to perform the rollback
-  rollbackScript = pkgs.writeScript "perform-rollback" ''
-    #!/bin/sh
+  # Script for confirmation command
+  confirmScript = pkgs.writeShellScript "nixos-confirm" ''
+    #!/usr/bin/env bash
     
-    # Get the previous generation
-    CURRENT_GEN=$(readlink -f /run/current-system | grep -o '[0-9]\+' | head -n1)
-    PREV_GEN=$((CURRENT_GEN - 1))
-    
-    # Announce the rollback
-    ${pkgs.utillinux}/bin/wall "WARNING: No confirmation received. Rolling back from generation $CURRENT_GEN to generation $PREV_GEN in 10 seconds..."
-    
-    # Sleep to give the user a chance to see the message
-    sleep 10
-    
-    # Perform the rollback
-    ${pkgs.utillinux}/bin/wall "Performing rollback now..."
-    /run/current-system/bin/switch-to-configuration test || true
-    /nix/var/nix/profiles/system-$PREV_GEN-link/bin/switch-to-configuration switch
-    
-    # Reboot if configured
-    if [ ${toString cfg.rebootAfterRollback} = 1 ]; then
-      ${pkgs.utillinux}/bin/wall "Rollback complete. Rebooting in 5 seconds..."
-      sleep 5
-      reboot
+    if [ -f /var/lib/auto-rollback/confirmation-needed ]; then
+      rm -f /var/lib/auto-rollback/confirmation-needed
+      systemctl stop auto-rollback-timer.service
+      echo "System change confirmed. Automatic rollback cancelled."
     else
-      ${pkgs.utillinux}/bin/wall "Rollback complete. Please reboot when convenient."
+      echo "No pending system changes to confirm."
     fi
+  '';
+  
+  # Script for rollback
+  rollbackScript = pkgs.writeShellScript "auto-rollback" ''
+    #!/usr/bin/env bash
+    set -euo pipefail
+    
+    if [ -f /var/lib/auto-rollback/confirmation-needed ]; then
+      if [ -f /var/lib/auto-rollback/rollback-gen ]; then
+        ROLLBACK_GEN=$(cat /var/lib/auto-rollback/rollback-gen)
+        echo "No confirmation received. Rolling back to generation $ROLLBACK_GEN..."
+        
+        # Actual rollback
+        /run/current-system/sw/bin/nixos-rebuild switch --rollback
+        
+        echo "Rollback complete. System has been switched to the previous generation."
+        wall "ATTENTION: No confirmation received for system change. System has been rolled back to the previous generation."
+      else
+        echo "Error: Rollback generation not found."
+        exit 1
+      fi
+    else
+      echo "No rollback needed."
+    fi
+  '';
+  
+  # Command to let users confirm the system change
+  nixosConfirmCommand = pkgs.writeShellScriptBin "nixos-confirm" ''
+    exec ${confirmScript}
   '';
 
 in {
   options.services.auto-rollback = {
-    enable = mkEnableOption "automatic rollback if a new generation is not confirmed";
-    
-    sshConfirmPort = mkOption {
-      type = types.port;
-      default = 2323;
-      description = "Port to listen on for SSH confirmation";
-    };
-    
-    rebootAfterRollback = mkOption {
-      type = types.bool;
-      default = true;
-      description = "Whether to reboot after rolling back";
+    enable = mkEnableOption "NixOS automatic rollback system";
+    timeoutMinutes = mkOption {
+      type = types.int;
+      default = 5;
+      description = "Minutes to wait for confirmation before rolling back";
     };
   };
 
   config = mkIf cfg.enable {
-    # Make sure the tools we need are installed
-    environment.systemPackages = with pkgs; [
-      netcat
-      socat
-      utillinux
-    ];
+    # Install the confirmation command for users
+    environment.systemPackages = [ nixosConfirmCommand ];
     
-    # Allow the confirmation port in the firewall (local only)
-    networking.firewall.extraCommands = ''
-      iptables -A INPUT -p tcp --dport ${toString cfg.sshConfirmPort} -s 127.0.0.1 -j ACCEPT
+    # Create directory for state files
+    system.activationScripts.auto-rollback-dir = ''
+      mkdir -p /var/lib/auto-rollback
+      chmod 755 /var/lib/auto-rollback
     '';
     
-    # Service to check for generation changes after boot
-    systemd.services.check-generation-change = {
-      description = "Check if NixOS generation has changed";
+    # Service that detects generation changes after a rebuild or reboot
+    systemd.services.auto-rollback-detector = {
+      description = "NixOS Generation Change Detector";
       wantedBy = [ "multi-user.target" ];
-      wants = [ "network.target" ];
       after = [ "network.target" ];
-      
       serviceConfig = {
         Type = "oneshot";
-        ExecStart = "${checkGenScript}";
+        ExecStart = genChangeDetectorScript;
       };
     };
     
-    # Service for prompting confirmation
-    systemd.services.generation-confirmation = {
-      description = "Prompt for confirmation of new NixOS generation";
-      after = [ "network.target" ];
-      
-      serviceConfig = {
-        Type = "simple";
-        ExecStart = "${confirmationScript}";
-      };
-    };
-    
-    # Service for checking generation change after each nixos-rebuild
-    systemd.services.post-rebuild-check = {
-      description = "Check for generation change after nixos-rebuild";
-      wantedBy = [ "multi-user.target" ];
-      
+    # Timer service that will perform the rollback if no confirmation received
+    systemd.services.auto-rollback-timer = {
+      description = "NixOS Automatic Rollback Timer";
       serviceConfig = {
         Type = "oneshot";
-        ExecStart = "${checkGenScript}";
-      };
-      
-      # This makes the confirmation service start when this service exits successfully
-      # (which happens when a generation change is detected)
-      unitConfig = {
-        OnSuccess = "generation-confirmation.service";
+        ExecStart = rollbackScript;
       };
     };
     
-    # Timer for auto-rollback
+    # Timer that activates the rollback after the timeout
     systemd.timers.auto-rollback-timer = {
-      description = "Timer for automatic rollback if no confirmation";
-      
+      description = "Timer for NixOS Automatic Rollback";
       timerConfig = {
-        OnActiveSec = "5min";
+        OnActiveSec = "${toString cfg.timeoutMinutes}m";
         AccuracySec = "1s";
       };
-      
-      wantedBy = [];  # Not started automatically, only by the confirmation script
     };
     
-    # Service executed by the timer to perform rollback
-    systemd.services.auto-rollback-timer = {
-      description = "Perform automatic rollback if no confirmation received";
-      
+    # Service that runs on every boot
+    systemd.services.auto-rollback-boot = {
+      description = "NixOS Generation Change Detector (Boot)";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "network.target" ];
       serviceConfig = {
         Type = "oneshot";
-        ExecStart = "${rollbackScript}";
+        ExecStart = genChangeDetectorScript;
       };
     };
     
-    # Add a path activation hook for nixos-rebuild
-    system.activationScripts.check-generation-change = ''
-      # Trigger the generation check service
-      systemctl start post-rebuild-check.service || true
-    '';
+    # PAM module to show message after login
+    security.pam.services = builtins.listToAttrs (map (pamService: {
+      name = pamService;
+      value = {
+        text = ''
+          session optional ${pkgs.pam_script}/lib/security/pam_script.so dir=${pkgs.writeTextDir "login_check.sh" ''
+            #!/bin/sh
+            if [ -f /var/lib/auto-rollback/confirmation-needed ]; then
+              echo "WARNING: NixOS configuration has changed. Please run 'nixos-confirm' within the timeout to prevent automatic rollback."
+            fi
+          ''}
+        '';
+      };
+    }) [ "login" "sshd" ]);
   };
 }
